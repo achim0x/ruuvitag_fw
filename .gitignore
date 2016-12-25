@@ -49,6 +49,12 @@ _build
 #VisualGDB Makefile
 nrf5x.mak
 
+#Eclipse Project Files
+.cproject
+.externalToolBuilders
+.project
+.settings
+
 #MacOS Junk
 .DS_Store
 
@@ -63,3 +69,5 @@ nRF5_SDK_12.0.0_12f24da
 nRF5_SDK_12.0.0_12f24da.zip
 nRF5_SDK_12.1.0_0d23e2a
 nRF5_SDK_12.1.0_0d23e2a.zip
+nRF5_SDK_12.2.0_f012efa
+nRF5_SDK_12.2.0_f012efa.zip
