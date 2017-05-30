@@ -6,38 +6,44 @@
 #define RUUVITAG_B3_H
 
 // LEDs definitions
-#define LEDS_NUMBER    2
-#define LED_START      17
-#define LED_1          17
-#define LED_2          19
-#define LED_STOP       19
-#define LEDS_LIST { LED_1, LED_2 }
-#define BSP_LED_0      LED_1
-#define BSP_LED_1      LED_2
-#define BSP_LED_0_MASK (1<<BSP_LED_0)
-#define BSP_LED_1_MASK (1<<BSP_LED_1)
-#define LEDS_MASK      (BSP_LED_0_MASK | BSP_LED_1_MASK)
-#define LEDS_INV_MASK  LEDS_MASK // LEDs are lit when GPIO low
-#define LED_RED LED_1
-#define LED_GREEN LED_2
+#define LEDS_NUMBER     2
+#define LED_START       17
+#define LED_1           17
+#define LED_2           19
+#define LED_1           17
+#define LED_STOP        19
+#define LEDS_LIST       { LED_1, LED_2 }
+#define BSP_LED_0       LED_1
+#define BSP_LED_1       LED_2
+#define BSP_LED_0_MASK  (1<<BSP_LED_0)
+#define BSP_LED_1_MASK  (1<<BSP_LED_1)
+#define LEDS_INV_MASK   LEDS_MASK // LEDs are lit when GPIO low
+#define LED_RED         LED_1
+#define LED_GREEN       LED_2
+#define LEDS_ACTIVE_STATE 0
 
-// XXX A workaround to use Nordic SDK 12.0.0 DFU bootloader code which relies on BSP_BUTTON_3
-#define BUTTONS_NUMBER 3
-#define BUTTON_START   13
-#define BUTTON_1       13
-#define BUTTON_STOP    13
-#define BUTTON_PULL    NRF_GPIO_PIN_PULLUP
-#define BUTTONS_LIST { BUTTON_1 }
-#define BSP_BUTTON_0   BUTTON_1
-#define BSP_BUTTON_0_MASK (1<<BSP_BUTTON_0)
-#define BUTTONS_MASK   (BSP_BUTTON_0_MASK) // or 0x00002000, 13th bit
-
-// XXX A workaround to use Nordic SDK 12.0.0 DFU bootloader code which relies on BSP_BUTTON_3
-// and BSP_LED_2
-#define BSP_BUTTON_2 BUTTON_1 
-#define BSP_BUTTON_3 BUTTON_1 
-#define BSP_LED_2 LED_1
-
+#ifndef RUUVI_BOOTLOADER_WORKAROUND
+  #define BUTTONS_NUMBER 1
+  #define BUTTON_START   13
+  #define BUTTON_1       13
+  #define BUTTON_STOP    13
+  #define BUTTON_PULL    NRF_GPIO_PIN_PULLUP
+  #define BUTTONS_LIST { BUTTON_1 }
+  #define BSP_BUTTON_0   BUTTON_1
+  #define BUTTONS_ACTIVE_STATE 0
+#else
+  #define BUTTONS_NUMBER 2
+  #define BUTTON_START   13
+  #define BUTTON_1       13
+  #define BUTTON_STOP    13
+  #define BUTTON_PULL    NRF_GPIO_PIN_PULLUP
+  #define BUTTONS_LIST { BUTTON_1, BUTTON_1 }
+  #define BSP_BUTTON_0   BUTTON_1
+  #define BUTTONS_ACTIVE_STATE 0
+  //For Bootloader
+  #define BSP_BUTTON_3 BUTTON_1
+  #define BSP_LED_2 LED_1
+#endif
 
 #define RX_PIN_NUMBER  4
 #define TX_PIN_NUMBER  5
