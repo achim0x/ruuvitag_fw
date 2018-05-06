@@ -11,32 +11,32 @@ For a detailed description see the detailed description in @ref LIS2DH12.h
 ***************************************************************************************************/
 
 /* INCLUDES ***************************************************************************************/
-#include "LIS2DH12.h"
-#include "LIS2DH12_registers.h"
+#include "lis2dh12.h"
+#include "lis2dh12_registers.h"
+
+#include <string.h>
+#include <stdlib.h>
+
 #include "spi.h"
 #include "nrf_drv_gpiote.h"
-#include "nrf_log.h"
-#include "nrf_log_ctrl.h"
+#include "nrf_delay.h"
 #include "nrf.h"
 #include "app_timer.h"
 #include "bsp.h"
 #include "boards.h"
+#include "init.h" //Timer ticks - todo: refactor
 
+#define NRF_LOG_MODULE_NAME "LIS2DH12"
+#include "nrf_log.h"
+#include "nrf_log_ctrl.h"
 
-#include <string.h>
 
 /* CONSTANTS **************************************************************************************/
 /** Maximum Size of SPI Addresses */
 #define ADR_MAX 0x3FU
 
-/** Number of maximum SPI Transfer retries */
-#define RETRY_MAX 3U
-
 /** Size of raw sensor data for all 3 axis */
 #define SENSOR_DATA_SIZE 6U
-
-/** Max number of registers to read at once. To read all axis at once, 6bytes are neccessary */
-#define READ_MAX SENSOR_DATA_SIZE
 
 /** Bit Mask to set read bit for SPI Transfer */
 #define SPI_READ 0x80U
@@ -46,246 +46,355 @@ For a detailed description see the detailed description in @ref LIS2DH12.h
 
 /* MACROS *****************************************************************************************/
 
-APP_TIMER_DEF(lis2dh12_timer_id);                           /** Creates timer id for our program **/
-#define SCHED_MAX_EVENT_DATA_SIZE       MAX(APP_TIMER_SCHED_EVT_SIZE, sizeof(nrf_drv_gpiote_pin_t))
-#define SCHED_QUEUE_SIZE                10
-
-/* TYPES ******************************************************************************************/
-/** Structure containing sensor data for all 3 axis */
-typedef struct
-{
-    int16_t x;
-    int16_t y;
-    int16_t z;
-} acceleration_t;
-
-/** Union to split raw data to values for each axis */
-typedef union
-{
-    uint8_t raw[SENSOR_DATA_SIZE];
-    acceleration_t sensor;
-} sensor_buffer_t;
 
 /* PROTOTYPES *************************************************************************************/
-
-static LIS2DH12_Ret selftest(void);
-
-LIS2DH12_Ret readRegister(uint8_t address, uint8_t* const p_toRead, uint8_t count);
-
-static LIS2DH12_Ret writeRegister(uint8_t address, uint8_t dataToWrite);
-
+static lis2dh12_ret_t selftest(void);
 void timer_lis2dh12_event_handler(void* p_context);
 
-
 /* VARIABLES **************************************************************************************/
-static LIS2DH12_drdy_event_t g_fp_drdyCb = NULL;        /**< Data Ready Callback */
-static sensor_buffer_t g_sensorData;                    /**< Union to covert raw data to value for each axis */
-static LIS2DH12_PowerMode g_powerMode = LIS2DH12_POWER_DOWN; /**< Current power mode */
-static LIS2DH12_Scale g_scale = LIS2DH12_SCALE2G;       /**< Selected scale */
-static uint8_t g_mgpb = 1;                              /**< milli-g per bit */
-static bool g_drdy = false;                             /**< Data Ready flag */
+static lis2dh12_scale_t      state_scale = LIS2DH12_SCALE16G;
+static lis2dh12_resolution_t state_resolution = LIS2DH12_RES10BIT;
+static const uint8_t lis2dh12_mgpb_map[] = {1,2,4,12};
 
-/* EXTERNAL FUNCTIONS *****************************************************************************/
-
-extern LIS2DH12_Ret LIS2DH12_init(LIS2DH12_PowerMode powerMode, LIS2DH12_Scale scale, LIS2DH12_drdy_event_t drdyCB)
+/**
+ *  Initializes LIS2DH12, and puts it in sleep mode.
+ *  
+ */
+lis2dh12_ret_t lis2dh12_init(void)
 {
-    LIS2DH12_Ret retVal = LIS2DH12_RET_OK;
-    uint32_t err_code = 0;
-    
-
-    /* Remember Callback. Note: NULL Pointer check not necessary, callback is optional */
-    g_fp_drdyCb = drdyCB;
+    lis2dh12_ret_t err_code = LIS2DH12_RET_OK;
 
     /* Initialize SPI */
-    if (false == spi_isInitialized())
-    {
-        spi_init();
-    }
+    if (false == spi_isInitialized()){ spi_init(); }
     
-    // Initialize the lis2dh12 timer module.
-    // Requires the low-frequency clock initialized
-    // Create timer
-    err_code = app_timer_create(&lis2dh12_timer_id,
-                                APP_TIMER_MODE_REPEATED,
-                                 timer_lis2dh12_event_handler);
-    APP_ERROR_CHECK(err_code);
-    //Timer is started when power mode is set
-
+    /** Reboot memory  - causes FIFO to fail - maybe delay is needed  before enabling axes? **/
+    //err_code |= lis2dh12_reset();
+    
     /* Start Selftest */
-    retVal |= selftest();
+    err_code |= selftest();
 
-    if (LIS2DH12_RET_OK == retVal)
-    {
-        /* Set Power Mode */
-        retVal |= LIS2DH12_setPowerMode(powerMode);
-
-        /* save Scale, Scale is set together with resolution in setPowerMode (CRTL4) */
-        g_scale = scale;
-    }
-
-    return retVal;
+    return err_code;
 }
 
-extern LIS2DH12_Ret LIS2DH12_setPowerMode(LIS2DH12_PowerMode powerMode)
+/** Reboots memory to default settings **/
+lis2dh12_ret_t lis2dh12_reset(void)
 {
-    LIS2DH12_Ret retVal = LIS2DH12_RET_OK;
-    uint8_t ctrl1RegVal = 0;
-    uint8_t ctrl4RegVal = 0;
-    uint32_t time_ms = 0;
-    uint32_t err_code; 
-
-    /* reset data ready flag, after changing power mode it needs some time till new data is available */
-    g_drdy = false;
-
-    /* Set Scale */
-    ctrl4RegVal = ((uint8_t)g_scale)<<4U;
-    /*Enable all axis */
-    ctrl1RegVal = LIS2DH_XYZ_EN_MASK;
-
-    switch(powerMode)
-    {
-    case LIS2DH12_POWER_NORMAL:
-        ctrl1RegVal |= LIS2DH_ODR_MASK_100HZ;
-        g_mgpb = 4 << g_scale; // 4 bits per mg at normal power/2g, adjust by scaling
-        time_ms = 10U;
-        break;
-    case LIS2DH12_POWER_LOW:
-        ctrl1RegVal |= (LIS2DH_ODR_MASK_1HZ); //Power consumption is same for low-power and normal mode at 1 Hz
-        g_mgpb = 4 << g_scale; // 4 bits per mg at normal power/2g, adjust by scaling
-        time_ms = 1000U;
-
-        break;
-    case LIS2DH12_POWER_FAST:
-        ctrl1RegVal |= (LIS2DH_ODR_MASK_1620HZ | LIS2DH_LPEN_MASK);
-        g_mgpb = 16 << g_scale; // 16 bits per mg at low power/2g, adjust by scaling
-        time_ms = 1;
-        break;
-    case LIS2DH12_POWER_HIGHRES:
-        ctrl1RegVal |= LIS2DH_ODR_MASK_HIGH_RES;
-        ctrl4RegVal |= LIS2DH_HR_MASK;
-        g_mgpb = 1 << g_scale; // 1 bits per mg at high power/2g, adjust by scaling
-        time_ms = 1;
-        break;
-    case LIS2DH12_POWER_DOWN:
-        ctrl1RegVal = 0;
-        time_ms = 0;
-        break;
-    default:
-        retVal = LIS2DH12_RET_ERROR;
-    }
-
-    if (LIS2DH12_RET_OK == retVal)
-    {
-        retVal = writeRegister(LIS2DH_CTRL_REG1, ctrl1RegVal);
-        retVal |= writeRegister(LIS2DH_CTRL_REG4, ctrl4RegVal);
-    }
-
-    /* save power mode to check in get functions if power is enabled */
-    g_powerMode = powerMode;
-
-    if (time_ms > 0)
-    {
-        /* start sample timer with sample time according to selected sample frequency */
-        err_code = app_timer_start(lis2dh12_timer_id, APP_TIMER_TICKS(time_ms, RUUVITAG_APP_TIMER_PRESCALER), NULL);
-        APP_ERROR_CHECK(err_code);
-    }
-    else
-    {
-        err_code = app_timer_stop(lis2dh12_timer_id);
-        APP_ERROR_CHECK(err_code);
-    }
-
-    return retVal;
+  lis2dh12_ret_t err_code = LIS2DH12_RET_OK;
+  uint8_t ctrl[3] = {0x10, 0x00, 0x07}; //Default values, only first and third are non-zero
+  err_code |= lis2dh12_write_register(0x1E, &ctrl[0], 1);
+  err_code |= lis2dh12_write_register(0x1F, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x20, &ctrl[2], 1);
+  err_code |= lis2dh12_write_register(0x21, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x22, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x23, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x24, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x25, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x26, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x2E, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x30, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x32, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x33, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x34, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x36, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x37, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x38, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x3A, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x3B, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x3C, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x3D, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x3E, &ctrl[1], 1);
+  err_code |= lis2dh12_write_register(0x3F, &ctrl[1], 1);
+ return err_code;
 }
 
-extern LIS2DH12_Ret LIS2DH12_getXmG(int32_t* const accX)
+/**
+ *  Enables X-Y-Z axes
+ */
+lis2dh12_ret_t lis2dh12_enable(void)
 {
-    LIS2DH12_Ret retVal = LIS2DH12_RET_OK;
-
-    if (NULL == accX)
-    {
-        retVal = LIS2DH12_RET_NULL;
-    }
-    else
-    {
-        //Scale value, note: values from accelerometer are 16-bit left-justified in all cases. "Extra" LSBs will be noise 
-        //Do not bit shift mg as bit shifting negative values is implementation specific operation.
-        //Scale 1/1024 to 1 / 1000.
-        *accX = g_sensorData.sensor.x / (16 << (g_scale)) * 1000 / 1024;
-    }
-
-    return retVal;
+    lis2dh12_ret_t err_code = LIS2DH12_RET_OK;
+    /* Enable XYZ axes */
+    uint8_t ctrl[1] = {0};
+    ctrl[0] = LIS2DH12_XYZ_EN_MASK;
+    err_code |= lis2dh12_write_register(LIS2DH12_CTRL_REG1, ctrl, 1);
+    return err_code;
 }
 
-extern LIS2DH12_Ret LIS2DH12_getYmG(int32_t* const accY)
+/**
+ *  
+ */
+lis2dh12_ret_t lis2dh12_set_scale(lis2dh12_scale_t scale)
 {
-    LIS2DH12_Ret retVal = LIS2DH12_RET_OK;
-
-    if (NULL == accY)
-    {
-        retVal = LIS2DH12_RET_NULL;
-    }
-    else
-    {
-        //Scale value, note: values from accelerometer are 16-bit left-justified in all cases. "Extra" LSBs will be noise 
-        //Do not bit shift mg as bit shifting negative values is implementation specific operation.
-        //Scale 1/1024 to 1 / 1000.
-        *accY = g_sensorData.sensor.y / (16 << (g_scale)) * 1000 / 1024;
-    }
-
-    return retVal;
+    lis2dh12_ret_t err_code = LIS2DH12_RET_OK;
+    //Read current value of CTRL4 Register
+    uint8_t ctrl4[1] = {0};
+    err_code |= lis2dh12_read_register(LIS2DH12_CTRL_REG4, ctrl4, 1);
+    //Reset scale bits
+    ctrl4[0] &= ~LIS2DH12_FS_MASK;
+    ctrl4[0] |= scale;
+    //Write register value back to lis2dh12
+    err_code |= lis2dh12_write_register(LIS2DH12_CTRL_REG4, ctrl4, 1);
+    if(LIS2DH12_RET_OK == err_code){ state_scale = scale; }
+    return err_code;
 }
 
-extern LIS2DH12_Ret LIS2DH12_getZmG(int32_t* const accZ)
+/**
+ *  Sets resolution to lis2dh12in bits
+ *  valid values are in enum lis2dh12_resolution_t
+ *  Invalid resolution will put device to normal power (10 bit) mode.
+ *
+ *  returns error code, 0 on success.
+ */
+lis2dh12_ret_t lis2dh12_set_resolution(lis2dh12_resolution_t resolution)
 {
-    LIS2DH12_Ret retVal = LIS2DH12_RET_OK;
-
-    if (NULL == accZ)
+    lis2dh12_ret_t err_code = LIS2DH12_RET_OK;
+    uint8_t ctrl1[1] = {0};
+    uint8_t ctrl4[1] = {0};
+    //Read registers 3 & 4
+    err_code |= lis2dh12_read_register(LIS2DH12_CTRL_REG1, ctrl1, 1);
+    err_code |= lis2dh12_read_register(LIS2DH12_CTRL_REG4, ctrl4, 1);
+    //Reset Low-power, high-resolution masks
+    ctrl1[0] &= ~LIS2DH12_LPEN_MASK;
+    ctrl4[0] &= ~LIS2DH12_HR_MASK;
+    switch(resolution)
     {
-        retVal = LIS2DH12_RET_NULL;
-    }
-    else
-    {
-        //Scale value, note: values from accelerometer are 16-bit left-justified in all cases. "Extra" LSBs will be noise 
-        //Do not bit shift mg as bit shifting negative values is implementation specific operation.
-        //Scale 1/1024 to 1 / 1000.
-        *accZ = g_sensorData.sensor.z / (16 << (g_scale)) * 1000 / 1024;
-    }
+        case LIS2DH12_RES12BIT:
+             ctrl4[0] |= LIS2DH12_HR_MASK;
+             break;
 
-    return retVal;
+        //No action needed
+        case LIS2DH12_RES10BIT:
+             break;
+
+        case LIS2DH12_RES8BIT:
+             ctrl1[0] |= LIS2DH12_LPEN_MASK;
+             break;
+        //Writing normal power to lis2dh12 is safe
+        default:
+             err_code |= LIS2DH12_RET_INVALID;
+             break;
+    }
+    err_code |= lis2dh12_write_register(LIS2DH12_CTRL_REG1, ctrl1, 1);
+    err_code |= lis2dh12_write_register(LIS2DH12_CTRL_REG4, ctrl4, 1);
+    if(LIS2DH12_RET_OK == err_code){ state_resolution = resolution; }    
+    return err_code;
 }
 
-extern LIS2DH12_Ret LIS2DH12_getALLmG(int32_t* const accX, int32_t* const accY, int32_t* const accZ)
+/**
+ *  
+ * Note: By design, when the device from high-resolution configuration (HR) is set to power-down 
+ * mode (PD), it is recommended to read register REFERENCE (26h)
+ * for a complete reset of the filtering block before switching to normal/high-performance mode again for proper 
+ * device functionality.
+ */
+lis2dh12_ret_t lis2dh12_set_sample_rate(lis2dh12_sample_rate_t sample_rate)
 {
-    LIS2DH12_Ret retVal = LIS2DH12_RET_OK;
+    lis2dh12_ret_t err_code = LIS2DH12_RET_OK;
+    uint8_t ctrl[1] = {0};
+    err_code |= lis2dh12_read_register(LIS2DH12_CTRL_REG1, ctrl, 1);
+    NRF_LOG_DEBUG("Read samplerate %x, status %d\r\n", ctrl[0], err_code);
+    // Clear sample rate bits
+    ctrl[0] &= ~LIS2DH12_ODR_MASK;
+    // Setup sample rate
+    ctrl[0] |= sample_rate;
+    err_code |= lis2dh12_write_register(LIS2DH12_CTRL_REG1, ctrl, 1);
+    NRF_LOG_DEBUG("Wrote samplerate %x, status %d\r\n", ctrl[0], err_code);
 
-    if ((NULL == accX) || (NULL == accY) || (NULL == accZ))
+    //Always read REFERENCE register when powering down to reset filter.
+    if(LIS2DH12_RATE_0 == sample_rate)
     {
-        retVal = LIS2DH12_RET_NULL;
+        err_code |= lis2dh12_read_register(LIS2DH12_CTRL_REG6, ctrl, 1);
     }
-    else
-    {
-        LIS2DH12_getXmG(accX);
-        LIS2DH12_getYmG(accY);
-        LIS2DH12_getZmG(accZ);
-    }
+    return err_code;
+}
 
-    return retVal;
+/**
+ *  Select FIFO mode
+ *
+ *  Bypass:         FiFo not in use. Setting Bypass resets FiFo
+ *  FIFO:           FiFo is in use. Accumulates data until full or reset
+ *  Stream:         FiFo is in use. Accumulates data, discarding oldest sample on overflow
+ *  Stream-to-FIFO: FiFo is in use. Starts in stream, switches to FIFO on interrupt. Remember to configure the interrupt source.
+ *
+ */
+lis2dh12_ret_t lis2dh12_set_fifo_mode(lis2dh12_fifo_mode_t mode)
+{
+    lis2dh12_ret_t err_code = LIS2DH12_RET_OK;
+    uint8_t ctrl_fifo[1] = {0};
+    uint8_t ctrl5[1] = {0};
+
+    err_code |= lis2dh12_read_register(LIS2DH12_CTRL_REG5, ctrl5, 1);
+    err_code |= lis2dh12_read_register(LIS2DH12_FIFO_CTRL_REG, ctrl_fifo, 1);
+
+    // Clear FiFo bits
+    ctrl_fifo[0] &= ~LIS2DH12_FM_MASK;
+    //Clear enable bit
+    ctrl5[0] &= ~LIS2DH12_FIFO_EN_MASK;
+    // Setup FiFo rate
+    ctrl_fifo[0] |= mode;
+    //Enable FiFo if appropriate
+    if(LIS2DH12_MODE_BYPASS != mode){ ctrl5[0] |= LIS2DH12_FIFO_EN_MASK; }
+    //FIFO must be enabled before setting mode
+    err_code |= lis2dh12_write_register(LIS2DH12_CTRL_REG5, ctrl5, 1);
+    err_code |= lis2dh12_write_register(LIS2DH12_FIFO_CTRL_REG, ctrl_fifo, 1);
+    return err_code;
+}
+
+/** Return factor for current state **/
+uint8_t get_mgpb()
+{
+    switch(state_scale)
+    {
+        case LIS2DH12_SCALE2G:  return lis2dh12_mgpb_map[0];
+        case LIS2DH12_SCALE4G:  return lis2dh12_mgpb_map[1];
+        case LIS2DH12_SCALE8G:  return lis2dh12_mgpb_map[2];
+        case LIS2DH12_SCALE16G: return lis2dh12_mgpb_map[3];
+        default:                return 0;
+    }
+}
+
+lis2dh12_ret_t lis2dh12_read_samples(lis2dh12_sensor_buffer_t* buffer, size_t count)
+{
+     lis2dh12_ret_t err_code = LIS2DH12_RET_OK;
+     size_t bytes_to_read = count*sizeof(lis2dh12_sensor_buffer_t);
+     NRF_LOG_DEBUG("Reading %d bytes \r\n", bytes_to_read);
+     err_code |= lis2dh12_read_register(LIS2DH12_OUT_X_L, (uint8_t*)buffer, count*sizeof(lis2dh12_sensor_buffer_t));
+     uint8_t mgpb = get_mgpb();
+     // Use constant bitshift, so we don't have to adjust mgpb with resolution
+     uint8_t justify = 4; 
+     for(int ii = 0; ii < count; ii++)
+     {
+        NRF_LOG_DEBUG("Before justification %d \r\n", buffer[ii].sensor.z);
+        buffer[ii].sensor.x >>= justify;
+        buffer[ii].sensor.y >>= justify;
+        buffer[ii].sensor.z >>= justify;
+        NRF_LOG_DEBUG("Before scaling %d \r\n", buffer[ii].sensor.z);
+        buffer[ii].sensor.x *= mgpb;
+        buffer[ii].sensor.y *= mgpb;
+        buffer[ii].sensor.z *= mgpb;
+     }
+     return err_code;
+}
+
+// put number of samples in HW FIFO to count
+lis2dh12_ret_t lis2dh12_get_fifo_sample_number(size_t* count)
+{
+    lis2dh12_ret_t err_code = LIS2DH12_RET_OK;    
+    uint8_t ctrl[1] = {0};
+    err_code |= lis2dh12_read_register(LIS2DH12_FIFO_SRC_REG, ctrl, 1);
+    *count = ctrl[0] & LIS2DH12_FSS_MASK;
+    return err_code;
+}
+
+// Generate watermark interrupt when FIFO reaches certain level
+lis2dh12_ret_t lis2dh12_set_fifo_watermark(size_t count)
+{
+    if(count > 32) return LIS2DH12_RET_INVALID;
+    lis2dh12_ret_t err_code = LIS2DH12_RET_OK;
+    uint8_t ctrl[1] = {0};
+    err_code |= lis2dh12_read_register(LIS2DH12_FIFO_CTRL_REG, ctrl, 1);
+    ctrl[0] &= ~LIS2DH12_FTH_MASK;
+    ctrl[0] += count;
+    err_code |= lis2dh12_write_register(LIS2DH12_FIFO_CTRL_REG, ctrl, 1);
+    return err_code;
+}
+
+/**
+ *  Set interrupt on pin. Write "0" To disable interrupt on pin. 
+ *  NOTE: pin 1 and pin 2 DO NOT support identical configurations.
+ *
+ *  @param interrupts interrupts, see registers.h
+ *  @param function 1 or 2, others are invalid
+ */
+lis2dh12_ret_t lis2dh12_set_interrupts(uint8_t interrupts, uint8_t function)
+{
+  if(1 != function && 2 != function){ return LIS2DH12_RET_INVALID; }
+  uint8_t ctrl[1]; 
+  ctrl[0] = interrupts;
+  uint8_t target_reg = LIS2DH12_CTRL_REG3;
+  if( 2 == function ) { target_reg = LIS2DH12_CTRL_REG6; }
+  return lis2dh12_write_register(target_reg, ctrl, 1);
+}
+
+/**
+ * Setup interrupt configuration: AND/OR of events, X-Y-Z Hi/Lo, 6-direction detection
+ *
+ * @param cfg, configuration. See registers.h for description
+ * @param function number of interrupt, 1 or 2. Others are invalid
+ *
+ * @return error code from SPI write or LIS2DH12_RET_INVALID if pin was invalid. 0 on success.
+ */
+lis2dh12_ret_t lis2dh12_set_interrupt_configuration(uint8_t cfg, uint8_t function)
+{
+  if(1 != function && 2 != function){ return LIS2DH12_RET_INVALID; }
+  uint8_t ctrl[1]; 
+  ctrl[0] = cfg;
+  uint8_t target_reg = LIS2DH12_INT1_CFG;
+  if( 2 == function ) { target_reg = LIS2DH12_INT2_CFG; }
+  return lis2dh12_write_register(target_reg, ctrl, 1);
+}
+
+/**
+ *  Setup number of LSBs needed to trigger activity interrupt.
+ *  Note: this targets only pin 2, and only if activity interrupt is enabled.
+ *
+ *  @param bits number of LSBs required to trigger the interrupt, max 0x7F
+ *
+ *  @return error code from stack
+ */
+lis2dh12_ret_t lis2dh12_set_activity_threshold(uint8_t bits)
+{
+  uint8_t ctrl[1];
+  ctrl[0] = bits;
+  return lis2dh12_write_register(LIS2DH12_ACT_THS, ctrl, 1);
+}
+
+/**
+ * Setup high-pass functions of lis2dh12. Select mode, cutoff frequency, filter data, click, interrputs.
+ *
+ * @param highpass byte to write to filter, resets previous settings.
+ * @return error code from SPI write. 
+ */
+lis2dh12_ret_t lis2dh12_set_highpass(uint8_t highpass)
+{
+    uint8_t ctrl[1];
+    ctrl[0] = highpass;
+    return lis2dh12_write_register(LIS2DH12_CTRL_REG2, ctrl, 1);
+}
+
+/**
+ *  Setup number of LSBs needed to trigger activity interrupt. 
+ *
+ *  @param bits number of LSBs required to trigger the interrupt
+ *  @param pin 1 or 2, others are invalid
+ *
+ *  @return error code from stack
+ */
+lis2dh12_ret_t lis2dh12_set_threshold(uint8_t bits, uint8_t pin)
+{
+  if(1 != pin && 2 != pin){ return LIS2DH12_RET_INVALID; }
+  uint8_t ctrl[1];
+  ctrl[0] = bits;
+  uint8_t target_reg = LIS2DH12_INT1_THS;
+  if(2 == pin) { target_reg = LIS2DH12_INT2_THS;} 
+  return lis2dh12_write_register(target_reg, ctrl, 1);
 }
 
 /* INTERNAL FUNCTIONS *****************************************************************************/
 
 /**
  * Execute LIS2DH12 Selftest
+ * TODO: Run the self-test internal to device
  *
  * @return LIS2DH12_RET_OK Selftest passed
  * @return LIS2DH12_RET_ERROR_SELFTEST Selftest failed
  */
-static LIS2DH12_Ret selftest(void)
+static lis2dh12_ret_t selftest(void)
 {
     uint8_t value[1] = {0};
-    readRegister(LIS2DH_WHO_AM_I, value, 1);
-    return (LIS2DH_I_AM_MASK == value[0]) ? LIS2DH12_RET_OK : LIS2DH12_RET_ERROR;
+    lis2dh12_read_register(LIS2DH12_WHO_AM_I, value, 1);
+    if(LIS2DH12_I_AM_MASK != value[0]) { NRF_LOG_ERROR("WHO_AM_I: %x\r\n", value[0])}
+    return (LIS2DH12_I_AM_MASK == value[0]) ? LIS2DH12_RET_OK : LIS2DH12_RET_ERROR;
 }
 
 /**
@@ -301,48 +410,34 @@ static LIS2DH12_Ret selftest(void)
  * @return LIS2DH12_RET_NULL Result buffer is NULL Pointer
  * @return LIS2DH12_RET_ERROR Read attempt was not successful
  */
-LIS2DH12_Ret readRegister(uint8_t address, uint8_t* const p_toRead, uint8_t count)
+lis2dh12_ret_t lis2dh12_read_register(const uint8_t address, uint8_t* const p_toRead, const size_t count)
 {
     NRF_LOG_DEBUG("LIS2DH12 Register read started'\r\n");
-    LIS2DH12_Ret retVal = LIS2DH12_RET_ERROR;
-    SPI_Ret retValSpi = SPI_RET_ERROR;
-    uint8_t writeBuf[READ_MAX + 1U] = {0}; /* Bytes to read + 1 for address */
-    uint8_t readBuf[READ_MAX + 1U] = {0};  /* Bytes to read + 1 for address */
-    uint8_t ii = 0; /* retry counter */
+    lis2dh12_ret_t err_code = LIS2DH12_RET_OK;
+    uint8_t* write_buffer   = calloc(count+1, sizeof(uint8_t));
+    //Separate buffer to read data, includes room for response to address byte. 
+    //This is pretty ineficient, TODO
+    uint8_t* read_buffer    = calloc(count+1, sizeof(uint8_t));
 
     if (NULL == p_toRead)
     {
-        retVal = LIS2DH12_RET_NULL;
-    }
-    else if (count > READ_MAX)
-    {
-        retVal = LIS2DH12_RET_ERROR;
+        err_code |= LIS2DH12_RET_NULL;
     }
     else
     {
-        do
+        write_buffer[0] = address | SPI_READ | SPI_ADR_INC;
+        err_code |= spi_transfer_lis2dh12(write_buffer, (count + 1U), read_buffer);
+
+        if (SPI_RET_OK == (SPI_Ret)err_code)
         {
-        writeBuf[0] = address | SPI_READ | SPI_ADR_INC;
-
-        retValSpi = spi_transfer_lis2dh12(writeBuf, (count + 1U), readBuf);
-        ii++;
-        }
-        while ((SPI_RET_BUSY == retValSpi) && (ii < RETRY_MAX)); /* Retry if SPI is busy */
-
-
-        if (SPI_RET_OK == retValSpi)
-        {
-            retVal = LIS2DH12_RET_OK;
             /* Transfer was ok, copy result */
-            memcpy(p_toRead, readBuf + 1U, count);
-        }
-        else
-        {
-            retVal = LIS2DH12_RET_ERROR;
+            memcpy(p_toRead, &(read_buffer[1]), count);
         }
     }
     NRF_LOG_DEBUG("LIS2DH12 Register read complete'\r\n");
-    return retVal;
+    free(read_buffer);
+    free(write_buffer);
+    return err_code;
 }
 
 /**
@@ -354,65 +449,23 @@ LIS2DH12_Ret readRegister(uint8_t address, uint8_t* const p_toRead, uint8_t coun
  * @return LIS2DH12_RET_OK No Error
  * @return LIS2DH12_RET_ERROR Address is lager than allowed
  */
-static LIS2DH12_Ret writeRegister(uint8_t address, uint8_t dataToWrite)
+lis2dh12_ret_t lis2dh12_write_register(uint8_t address, uint8_t* const dataToWrite, size_t count)
 {
-    LIS2DH12_Ret retVal = LIS2DH12_RET_ERROR;
-    SPI_Ret retValSpi = SPI_RET_ERROR;
-    uint8_t to_read[2] = {0U}; /* dummy, not used for writing */
-    uint8_t to_write[2] = {0U};
-    uint8_t ii = 0; /* retry counter */
+    lis2dh12_ret_t err_code = LIS2DH12_RET_OK;
+    uint8_t* to_read  = calloc(count+1, sizeof(uint8_t)); /* dummy, not used for writing */
+    uint8_t* to_write = calloc(count+1, sizeof(uint8_t));
 
     /* SPI Addresses are 5bit only */
     if (address <= ADR_MAX)
     {
         to_write[0] = address;
-        to_write[1] = dataToWrite;
+        memcpy(&(to_write[1]), dataToWrite, count);
 
-        do
-        {
-            retValSpi = spi_transfer_lis2dh12(to_write, 2, to_read);
-            ii++;
-        }
-        while ((SPI_RET_BUSY == retValSpi) && (ii < RETRY_MAX)); /* Retry if SPI is busy */
-
-        if (SPI_RET_OK == retValSpi)
-        {
-            retVal = LIS2DH12_RET_OK;
-        }
-        else
-        {
-            retVal = LIS2DH12_RET_ERROR;
-        }
+        err_code |= spi_transfer_lis2dh12(to_write, (count+1), to_read);
     }
-    else
-    {
-        retVal = LIS2DH12_RET_ERROR;
-    }
+    free(to_read);
+    free(to_write);
 
-    return retVal;
+    return err_code;
 }
 
-/**
- * Event Handler that is called by the timer to read the sensor values.
- *
- * This is a workaround because data ready interrupt from LIS2DH12 is not working
- *
- * @param [in] pContext Timer Context
- */
-void timer_lis2dh12_event_handler(void* p_context)
-{
-    NRF_LOG_DEBUG("LIS2DH12 Timer event'\r\n");
-    //nrf_gpio_pin_toggle(19);
-
-    if (LIS2DH12_RET_OK == readRegister(LIS2DH_OUT_X_L, g_sensorData.raw, SENSOR_DATA_SIZE))
-    {
-        /* if read was successfull set data ready */
-        g_drdy = true;
-
-        /* call data ready event callback if registered */
-        if (NULL != g_fp_drdyCb)
-        {
-            g_fp_drdyCb();
-        }
-    }
-}
